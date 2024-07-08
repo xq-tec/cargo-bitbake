@@ -21,11 +21,10 @@ use anyhow::{anyhow, Context as _};
 use cargo::core::registry::PackageRegistry;
 use cargo::core::resolver::features::HasDevUnits;
 use cargo::core::resolver::CliFeatures;
-use cargo::core::source::GitReference;
-use cargo::core::{Package, PackageSet, Resolve, Workspace};
+use cargo::core::{GitReference, Package, PackageSet, Resolve, Workspace};
 use cargo::ops;
 use cargo::util::{important_paths, CargoResult};
-use cargo::{CliResult, Config};
+use cargo::{CliResult, GlobalContext};
 use itertools::Itertools;
 use std::default::Default;
 use std::env;
@@ -42,7 +41,7 @@ const CRATES_IO_URL: &str = "crates.io";
 
 /// Represents the package we are trying to generate a recipe for
 struct PackageInfo<'cfg> {
-    cfg: &'cfg Config,
+    cfg: &'cfg GlobalContext,
     current_manifest: PathBuf,
     ws: Workspace<'cfg>,
 }
@@ -50,7 +49,7 @@ struct PackageInfo<'cfg> {
 impl<'cfg> PackageInfo<'cfg> {
     /// creates our package info from the config and the `manifest_path`,
     /// which may not be provided
-    fn new(config: &Config, manifest_path: Option<String>) -> CargoResult<PackageInfo> {
+    fn new(config: &GlobalContext, manifest_path: Option<String>) -> CargoResult<PackageInfo> {
         let manifest_path = manifest_path.map_or_else(|| config.cwd().to_path_buf(), PathBuf::from);
         let root = important_paths::find_root_manifest_for_wd(&manifest_path)?;
         let ws = Workspace::new(&root, config)?;
@@ -157,7 +156,7 @@ enum Opt {
 }
 
 fn main() {
-    let mut config = Config::default().unwrap();
+    let mut config = GlobalContext::default().unwrap();
     let Opt::Bitbake(opt) = Opt::from_args();
     let result = real_main(opt, &mut config);
     if let Err(e) = result {
@@ -165,7 +164,7 @@ fn main() {
     }
 }
 
-fn real_main(options: Args, config: &mut Config) -> CliResult {
+fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
     config.configure(
         options.verbose as u32,
         options.quiet,
@@ -200,12 +199,11 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
     }
 
     // Resolve all dependencies (generate or use Cargo.lock as necessary)
-    let resolve = md.resolve()?;
+    let (_, resolve) = md.resolve()?;
 
     // build the crate URIs
     let mut src_uri_extras = vec![];
     let mut src_uris = resolve
-        .1
         .iter()
         .filter_map(|pkg| {
             // get the source info for this package
@@ -239,7 +237,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
                 src_uri_extras.push(format!("SRCREV_FORMAT .= \"_{}\"", pkg.name()));
 
                 let precise = if options.reproducible {
-                    src_id.precise()
+                    src_id.precise_git_fragment()
                 } else {
                     None
                 };
@@ -254,7 +252,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
                                 // avoid reduced hashes
                                 s
                             } else {
-                                let precise = src_id.precise();
+                                let precise = src_id.precise_git_fragment();
                                 if let Some(p) = precise {
                                     p
                                 } else {
@@ -367,7 +365,11 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         }
         // we should be using ${SRCPV} here but due to a bitbake bug we cannot. see:
         // https://github.com/meta-rust/meta-rust/issues/136
-        format!("{} = \".AUTOINC+{}\"", pv_append_key, &project_repo.rev[..10])
+        format!(
+            "{} = \".AUTOINC+{}\"",
+            pv_append_key,
+            &project_repo.rev[..10],
+        )
     } else {
         // its a tag so nothing needed
         "".into()
