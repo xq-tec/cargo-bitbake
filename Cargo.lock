@@ -297,7 +297,9 @@ dependencies = [
  "lazy_static",
  "md5",
  "regex",
+ "semver",
  "structopt",
+ "toml",
 ]
 
 [[package]]

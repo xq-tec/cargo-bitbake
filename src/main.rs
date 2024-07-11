@@ -18,14 +18,15 @@ extern crate regex;
 extern crate structopt;
 
 use anyhow::{anyhow, Context as _};
-use cargo::core::registry::PackageRegistry;
-use cargo::core::resolver::features::HasDevUnits;
 use cargo::core::resolver::CliFeatures;
+use cargo::core::{resolver::features::HasDevUnits, MaybePackage};
 use cargo::core::{GitReference, Package, PackageSet, Resolve, Workspace};
 use cargo::ops;
 use cargo::util::{important_paths, CargoResult};
+use cargo::{core::registry::PackageRegistry, sources::CRATES_IO_DOMAIN};
 use cargo::{CliResult, GlobalContext};
 use itertools::Itertools;
+use semver::Version;
 use std::default::Default;
 use std::env;
 use std::fs::OpenOptions;
@@ -37,47 +38,117 @@ use structopt::StructOpt;
 mod git;
 mod license;
 
-const CRATES_IO_URL: &str = "crates.io";
+struct Metadata<'cfg> {
+    name: &'cfg str,
+    version: Version,
+    description: Option<&'cfg str>,
+    homepage: Option<&'cfg str>,
+    repository: Option<&'cfg str>,
+    license: Option<&'cfg str>,
+    license_file: Option<&'cfg str>,
+}
+
+impl<'cfg> Metadata<'cfg> {
+    fn load(ws: &'cfg Workspace<'cfg>) -> CargoResult<Self> {
+        match ws.root_maybe() {
+            MaybePackage::Virtual(virt) => {
+                let metadata = virt
+                    .resolved_toml()
+                    .workspace
+                    .as_ref()
+                    .context("missing 'workspace' table")?
+                    .metadata
+                    .as_ref()
+                    .context("missing 'workspace.metadata' table")?
+                    .as_table()
+                    .context("'workspace.metadata' must be a table")?;
+                let get_str = |field_name| -> CargoResult<&str> {
+                    metadata
+                        .get(field_name)
+                        .with_context(|| {
+                            format!("missing '{field_name}' field in 'workspace.metadata'")
+                        })?
+                        .as_str()
+                        .context("'workspace.metadata.name' must be a string")
+                };
+                let get_str_opt = |field_name| -> CargoResult<Option<&str>> {
+                    metadata
+                        .get(field_name)
+                        .map(|field| {
+                            field
+                                .as_str()
+                                .context("'workspace.metadata.name' must be a string")
+                        })
+                        .transpose()
+                };
+
+                Ok(Self {
+                    name: get_str("name")?,
+                    version: get_str("version")?.parse()?,
+                    description: get_str_opt("description")?,
+                    homepage: get_str_opt("homepage")?,
+                    repository: get_str_opt("repository")?,
+                    license: get_str_opt("license")?,
+                    license_file: get_str_opt("license-file")?,
+                })
+            }
+            MaybePackage::Package(pkg) => {
+                let metadata = pkg.manifest().metadata();
+                Ok(Self {
+                    name: pkg.name().as_str(),
+                    version: pkg.version().clone(),
+                    description: metadata.description.as_deref(),
+                    homepage: metadata.homepage.as_deref(),
+                    repository: metadata.repository.as_deref(),
+                    license: metadata.license.as_deref(),
+                    license_file: metadata.license_file.as_deref(),
+                })
+            }
+        }
+    }
+}
 
 /// Represents the package we are trying to generate a recipe for
-struct PackageInfo<'cfg> {
+struct Project<'cfg> {
     cfg: &'cfg GlobalContext,
     current_manifest: PathBuf,
     ws: Workspace<'cfg>,
 }
 
-impl<'cfg> PackageInfo<'cfg> {
+impl<'cfg> Project<'cfg> {
     /// creates our package info from the config and the `manifest_path`,
     /// which may not be provided
-    fn new(config: &GlobalContext, manifest_path: Option<String>) -> CargoResult<PackageInfo> {
+    fn new(config: &GlobalContext, manifest_path: Option<String>) -> CargoResult<Project> {
         let manifest_path = manifest_path.map_or_else(|| config.cwd().to_path_buf(), PathBuf::from);
         let root = important_paths::find_root_manifest_for_wd(&manifest_path)?;
         let ws = Workspace::new(&root, config)?;
-        Ok(PackageInfo {
+        Ok(Project {
             cfg: config,
             current_manifest: root,
             ws,
         })
     }
 
-    /// provides the current package we are working with
-    fn package(&self) -> CargoResult<&Package> {
-        self.ws.current()
+    /// Returns the set of all packages in the workspace.
+    fn packages(&self) -> Vec<&Package> {
+        self.ws.members().collect()
     }
 
     /// Generates a package registry by using the Cargo.lock or
     /// creating one as necessary
-    fn registry(&self) -> CargoResult<PackageRegistry<'cfg>> {
+    fn registry(&self, packages: &[&Package]) -> CargoResult<PackageRegistry<'cfg>> {
         let mut registry = PackageRegistry::new(self.cfg)?;
-        let package = self.package()?;
-        registry.add_sources(vec![package.package_id().source_id()])?;
+        let source_ids = packages
+            .iter()
+            .map(|package| package.package_id().source_id());
+        registry.add_sources(source_ids)?;
         Ok(registry)
     }
 
     /// Resolve the packages necessary for the workspace
-    fn resolve(&self) -> CargoResult<(PackageSet<'cfg>, Resolve)> {
+    fn resolve(&self, packages: &[&Package]) -> CargoResult<(PackageSet<'cfg>, Resolve)> {
         // build up our registry
-        let mut registry = self.registry()?;
+        let mut registry = self.registry(packages)?;
 
         // resolve our dependencies
         let (packages, resolve) = ops::resolve_ws(&self.ws)?;
@@ -185,21 +256,17 @@ fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
     )?;
 
     // Build up data about the package we are attempting to generate a recipe for
-    let md = PackageInfo::new(config, None)?;
+    let project = Project::new(config, None)?;
+    let metadata = Metadata::load(&project.ws)?;
 
-    // Our current package
-    let package = md.package()?;
-    let crate_root = package
-        .manifest_path()
-        .parent()
-        .expect("Cargo.toml must have a parent");
-
-    if package.name().contains('_') {
-        println!("Package name contains an underscore");
+    if metadata.name.contains('_') {
+        println!("Project name contains an underscore");
     }
 
+    // All packages in the workspace
+    let ws_packages = project.packages();
     // Resolve all dependencies (generate or use Cargo.lock as necessary)
-    let (_, resolve) = md.resolve()?;
+    let (_, resolve) = project.resolve(&ws_packages)?;
 
     // build the crate URIs
     let mut src_uri_extras = vec![];
@@ -208,13 +275,20 @@ fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
         .filter_map(|pkg| {
             // get the source info for this package
             let src_id = pkg.source_id();
-            if pkg.name() == package.name() {
+            if ws_packages.iter().any(|ws_pkg| ws_pkg.name() == pkg.name()) {
                 None
-            } else if src_id.is_registry() {
+            } else if src_id.is_crates_io() {
                 // this package appears in a crate registry
+                if let Some(Some(csum)) = resolve.checksums().get(&pkg) {
+                    src_uri_extras.push(format!(
+                        "SRC_URI[{name}-{version}.sha256sum] = \"{csum}\"",
+                        name = pkg.name(),
+                        version = pkg.version()
+                    ));
+                }
                 Some(format!(
                     "    crate://{}/{}/{} \\\n",
-                    CRATES_IO_URL,
+                    CRATES_IO_DOMAIN,
                     pkg.name(),
                     pkg.version()
                 ))
@@ -287,53 +361,40 @@ fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
 
     // sort the crate list
     src_uris.sort();
-
-    // root package metadata
-    let metadata = package.manifest().metadata();
+    src_uri_extras.sort();
 
     // package description is used as BitBake summary
-    let summary = metadata.description.as_ref().map_or_else(
-        || {
-            println!("No package.description set in your Cargo.toml, using package.name");
-            package.name()
-        },
-        |s| cargo::util::interning::InternedString::new(&s.trim().replace("\n", " \\\n")),
-    );
+    let summary = metadata.description.unwrap_or_else(|| {
+        println!("No 'description' field set in your Cargo.toml, using 'name' field");
+        metadata.name
+    });
 
     // package homepage (or source code location)
     let homepage = metadata
         .homepage
-        .as_ref()
         .map_or_else(
             || {
-                println!("No package.homepage set in your Cargo.toml, trying package.repository");
+                println!("No 'homepage' field set in your Cargo.toml, trying 'repository' field");
                 metadata
                     .repository
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("No package.repository set in your Cargo.toml"))
+                    .ok_or_else(|| anyhow!("No 'repository' field set in your Cargo.toml"))
             },
             Ok,
         )?
         .trim();
 
     // package license
-    let license = metadata.license.as_ref().map_or_else(
-        || {
-            println!("No package.license set in your Cargo.toml, trying package.license_file");
-            metadata.license_file.as_ref().map_or_else(
-                || {
-                    println!("No package.license_file set in your Cargo.toml");
-                    println!("Assuming {} license", license::CLOSED_LICENSE);
-                    license::CLOSED_LICENSE
-                },
-                String::as_str,
-            )
-        },
-        String::as_str,
-    );
+    let license = metadata.license.unwrap_or_else(|| {
+        println!("No 'license' field set in your Cargo.toml, trying 'license-file' field");
+        metadata.license_file.unwrap_or_else(|| {
+            println!("No 'license-file' field set in your Cargo.toml");
+            println!("Assuming {} license", license::CLOSED_LICENSE);
+            license::CLOSED_LICENSE
+        })
+    });
 
     // compute the relative directory into the repo our Cargo.toml is at
-    let rel_dir = md.rel_dir()?;
+    let rel_dir = project.rel_dir()?;
 
     // license files for the package
     let mut lic_files = vec![];
@@ -342,7 +403,7 @@ fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
     for lic in licenses {
         lic_files.push(format!(
             "    {}",
-            license::file(crate_root, &rel_dir, lic, single_license)
+            license::file(project.ws.root(), &rel_dir, lic, single_license)
         ));
     }
 
@@ -376,7 +437,11 @@ fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
     };
 
     // build up the path
-    let recipe_path = PathBuf::from(format!("{}_{}.bb", package.name(), package.version()));
+    let recipe_path = PathBuf::from(format!(
+        "{name}_{version}.bb",
+        name = metadata.name,
+        version = metadata.version,
+    ));
 
     // Open the file where we'll write the BitBake recipe
     let mut file = OpenOptions::new()
@@ -384,15 +449,14 @@ fn real_main(options: Args, config: &mut GlobalContext) -> CliResult {
         .create(true)
         .truncate(true)
         .open(&recipe_path)
-        // CliResult accepts only failure::Error, not failure::Context
         .map_err(|e| anyhow!("Unable to open bitbake recipe file with: {}", e))?;
 
     // write the contents out
     write!(
         file,
         include_str!("bitbake.template"),
-        name = package.name(),
-        version = package.version(),
+        name = metadata.name,
+        version = metadata.version,
         summary = summary,
         homepage = homepage,
         license = license,
